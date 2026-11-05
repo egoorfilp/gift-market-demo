@@ -4,7 +4,6 @@ import html
 import uuid
 import sqlite3
 import logging
-
 from decimal import Decimal, InvalidOperation
 
 from telegram import (
@@ -16,6 +15,8 @@ from telegram import (
     LinkPreviewOptions,
 )
 
+from telegram.constants import ParseMode
+
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -26,120 +27,143 @@ from telegram.ext import (
     filters,
 )
 
+
+# =========================
+# CONFIG
+# =========================
+
+TOKEN = os.environ["BOT_TOKEN"]
+
+GRAM_EMOJI_ID = os.getenv(
+    "GRAM_EMOJI_ID",
+    "5318901904686754959",
+)
+
+DB_PATH = os.getenv(
+    "DB_PATH",
+    "offers.db",
+)
+
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     level=logging.INFO,
 )
 
-TOKEN = os.environ["BOT_TOKEN"]
-
-GRAM_ID = os.getenv(
-    "GRAM_EMOJI_ID",
-    "5318901904686754959"
-)
-
-DB_PATH = os.getenv("DB_PATH", "offers.db")
+logger = logging.getLogger(__name__)
 
 
-# =====================================
+# =========================
 # DATABASE
-# =====================================
+# =========================
 
-def connect():
-    return sqlite3.connect(DB_PATH)
+def db():
+    connection = sqlite3.connect(DB_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
 
 
 def init_db():
-    with connect() as db:
-        db.execute("""
+    with db() as connection:
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS offers (
                 id TEXT PRIMARY KEY,
                 owner INTEGER NOT NULL,
                 buyer TEXT NOT NULL,
-                title TEXT NOT NULL,
-                url TEXT NOT NULL,
+                gift_name TEXT NOT NULL,
+                gift_number TEXT NOT NULL,
+                gift_url TEXT NOT NULL,
                 price TEXT NOT NULL,
                 currency TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending'
+                status TEXT NOT NULL DEFAULT 'pending',
+                recipient INTEGER
             )
-        """)
+            """
+        )
 
 
 def save_offer(offer):
-    with connect() as db:
-        db.execute(
+    with db() as connection:
+        connection.execute(
             """
-            INSERT INTO offers
-            (id, owner, buyer, title, url,
-             price, currency, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO offers (
+                id,
+                owner,
+                buyer,
+                gift_name,
+                gift_number,
+                gift_url,
+                price,
+                currency,
+                status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 offer["id"],
                 offer["owner"],
                 offer["buyer"],
-                offer["title"],
-                offer["url"],
+                offer["gift_name"],
+                offer["gift_number"],
+                offer["gift_url"],
                 offer["price"],
                 offer["currency"],
-                offer["status"],
+                "pending",
             ),
         )
 
 
 def get_offer(offer_id):
-    with connect() as db:
-        db.row_factory = sqlite3.Row
-
-        row = db.execute(
+    with db() as connection:
+        row = connection.execute(
             "SELECT * FROM offers WHERE id = ?",
             (offer_id,),
         ).fetchone()
 
-        return dict(row) if row else None
+    return dict(row) if row else None
 
 
-def get_offers(owner):
-    with connect() as db:
-        db.row_factory = sqlite3.Row
-
-        rows = db.execute(
+def get_user_offers(user_id):
+    with db() as connection:
+        rows = connection.execute(
             """
             SELECT * FROM offers
             WHERE owner = ?
             ORDER BY rowid DESC
             LIMIT 30
             """,
-            (owner,),
+            (user_id,),
         ).fetchall()
 
-        return [dict(row) for row in rows]
+    return [dict(row) for row in rows]
 
 
-def update_status(offer_id, status):
-    with connect() as db:
-        db.execute(
+def update_offer_status(offer_id, old_status, new_status, recipient=None):
+    with db() as connection:
+        result = connection.execute(
             """
             UPDATE offers
-            SET status = ?
-            WHERE id = ?
+            SET status = ?, recipient = ?
+            WHERE id = ? AND status = ?
             """,
-            (status, offer_id),
+            (
+                new_status,
+                recipient,
+                offer_id,
+                old_status,
+            ),
         )
 
+        return result.rowcount > 0
 
-# =====================================
-# HELPERS
-# =====================================
 
-def esc(value):
-    return html.escape(str(value), quote=True)
-
+# =========================
+# GIFT
+# =========================
 
 def parse_gift(text):
-    match = re.fullmatch(
-        r"(?:https?://)?t\.me/nft/"
-        r"([A-Za-z0-9_-]+)-(\d+)/?",
+    match = re.search(
+        r"(?:https?://)?t\.me/nft/([A-Za-z0-9_-]+)-(\d+)",
         text.strip(),
         re.IGNORECASE,
     )
@@ -147,40 +171,69 @@ def parse_gift(text):
     if not match:
         return None
 
-    collection = match.group(1)
+    slug = match.group(1)
     number = match.group(2)
 
+    name = re.sub(
+        r"(?<=[a-z])(?=[A-Z])",
+        " ",
+        slug,
+    )
+
     return {
-        "title": f"{collection} #{number}",
-        "url": (
-            f"https://t.me/nft/"
-            f"{collection}-{number}"
-        ),
+        "gift_name": name,
+        "gift_number": number,
+        "gift_url": f"https://t.me/nft/{slug}-{number}",
     }
 
 
+def gift_title(offer):
+    return (
+        f'{offer["gift_name"]} '
+        f'#{offer["gift_number"]}'
+    )
+
+
+# =========================
+# EMOJI / PRICE
+# =========================
+
+def gram_emoji():
+    return (
+        f'<tg-emoji emoji-id="{GRAM_EMOJI_ID}">'
+        "💎"
+        "</tg-emoji>"
+    )
+
+
 def price_html(offer):
-    price = esc(offer["price"])
+    price = html.escape(str(offer["price"]))
 
     if offer["currency"] == "GRAM":
-        return (
-            f"{price} "
-            f'<tg-emoji emoji-id="{GRAM_ID}">'
-            "💎"
-            "</tg-emoji>"
-        )
+        return f"{price} {gram_emoji()} GRAM"
 
     return f"{price} TON"
 
 
 def price_plain(offer):
-    return (
-        f"{offer['price']} "
-        f"{offer['currency']}"
+    if offer["currency"] == "GRAM":
+        return f'{offer["price"]} 💎 GRAM'
+
+    return f'{offer["price"]} TON'
+
+
+def gift_link_html(offer):
+    url = html.escape(
+        offer["gift_url"],
+        quote=True,
     )
 
+    title = html.escape(gift_title(offer))
 
-def preview():
+    return f'<a href="{url}">{title}</a>'
+
+
+def preview_options():
     return LinkPreviewOptions(
         is_disabled=False,
         show_above_text=True,
@@ -188,553 +241,150 @@ def preview():
     )
 
 
-# =====================================
-# OFFER CARD
-# =====================================
+# =========================
+# OFFER TEXTS
+# =========================
 
-def offer_text(offer):
-    title = esc(offer["title"])
-    buyer = esc(offer["buyer"])
-    price = price_html(offer)
+def pending_text(offer):
+    buyer = html.escape(offer["buyer"])
 
-    # Ссылка находится внутри названия.
-    # Telegram использует её для карточки NFT.
-    gift = (
-        f'<a href="{esc(offer["url"])}">'
-        f"{title}</a>"
+    return (
+        f'{gift_link_html(offer)}\n\n'
+        f'Пользователь <b>{buyer}</b> предлагает '
+        f'Вам <b>{price_html(offer)}</b> '
+        f'за подарок <b>{html.escape(gift_title(offer))}</b>.'
     )
 
-    status = offer["status"]
 
-    if status == "pending":
-        return (
-            f"Пользователь {buyer} предлагает "
-            f"Вам {price} за подарок {gift}."
-        )
+def accepted_text(offer):
+    return (
+        f'{gift_link_html(offer)}\n\n'
+        "<b>Предложение принято!</b>\n\n"
+        f'Подарок: <b>{html.escape(gift_title(offer))}</b>\n'
+        f'Стоимость: <b>{price_html(offer)}</b>\n\n'
+        "Статус: <b>Ожидается оплата</b>."
+    )
 
-    if status == "accepted":
-        return (
-            f"{gift}\n\n"
-            "Предложение принято.\n"
-            f"Цена: {price}\n\n"
-            "Статус: ожидается оплата."
-        )
 
-    if status == "rejected":
-        return (
-            f"{gift}\n\n"
-            "Предложение отклонено."
-        )
+def rejected_text(offer):
+    return (
+        f'{gift_link_html(offer)}\n\n'
+        "<b>Предложение отклонено.</b>\n\n"
+        f'Стоимость: <b>{price_html(offer)}</b>'
+    )
 
-    if status == "demo_paid":
-        return (
-            f"{gift}\n\n"
-            "ТЕСТОВЫЙ РЕЖИМ\n"
-            "Продажа успешно смоделирована.\n\n"
-            f"Цена: {price}\n"
-            "Реальная оплата не производилась."
-        )
 
-    return "Предложение недоступно."
+def offer_text(offer):
+    if offer["status"] == "accepted":
+        return accepted_text(offer)
+
+    if offer["status"] == "rejected":
+        return rejected_text(offer)
+
+    return pending_text(offer)
+
+
+# =========================
+# KEYBOARDS
+# =========================
+
+def main_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Создать оффер",
+                    callback_data="create",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Мои офферы",
+                    callback_data="my_offers",
+                )
+            ],
+        ]
+    )
+
+
+def currency_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "💎 GRAM",
+                    callback_data="currency:GRAM",
+                ),
+                InlineKeyboardButton(
+                    "TON",
+                    callback_data="currency:TON",
+                ),
+            ]
+        ]
+    )
 
 
 def offer_keyboard(offer):
     offer_id = offer["id"]
-    status = offer["status"]
 
-    if status == "pending":
-        return InlineKeyboardMarkup([
+    if offer["status"] == "pending":
+        return InlineKeyboardMarkup(
             [
-                InlineKeyboardButton(
-                    "Отклонить",
-                    callback_data=f"reject:{offer_id}",
-                ),
-                InlineKeyboardButton(
-                    "Принять",
-                    callback_data=f"accept:{offer_id}",
-                ),
+                [
+                    InlineKeyboardButton(
+                        "Отклонить",
+                        callback_data=f"reject:{offer_id}",
+                    ),
+                    InlineKeyboardButton(
+                        "Принять",
+                        callback_data=f"accept:{offer_id}",
+                    ),
+                ]
             ]
-        ])
+        )
 
-    if status == "accepted":
-        return InlineKeyboardMarkup([
+    if offer["status"] == "accepted":
+        return InlineKeyboardMarkup(
             [
-                InlineKeyboardButton(
-                    "Статус оплаты",
-                    callback_data=f"payment:{offer_id}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "Как завершить сделку?",
-                    callback_data=f"help:{offer_id}",
-                )
-            ],
-        ])
+                [
+                    InlineKeyboardButton(
+                        "Статус оплаты",
+                        callback_data=f"payment:{offer_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "Как завершить сделку?",
+                        callback_data=f"help:{offer_id}",
+                    )
+                ],
+            ]
+        )
 
     return None
 
 
-def main_menu():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "Создать оффер",
-                callback_data="create",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "Мои офферы",
-                callback_data="my_offers",
-            )
-        ],
-    ])
-
-
-# =====================================
+# =========================
 # START
-# =====================================
+# =========================
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+
     await update.message.reply_text(
-        "Gift Market\n\n"
-        "Создание предложений для NFT-подарков.",
-        reply_markup=main_menu(),
+        "<b>Gift Market</b>\n\n"
+        "Создавай предложения о покупке "
+        "коллекционных подарков Telegram.\n\n"
+        "Выбери действие:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_keyboard(),
     )
 
 
-async def create_offer(update, context):
+async def create_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     context.user_data["step"] = "gift"
 
-    await update.effective_message.reply_text(
-        "Отправь ссылку на NFT-подарок."
-    )
-
-
-# =====================================
-# CREATE OFFER
-# =====================================
-
-async def messages(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    message = update.message
-
-    if not message or not message.text:
-        return
-
-    text = message.text.strip()
-    step = context.user_data.get("step")
-
-    if step == "gift":
-        gift = parse_gift(text)
-
-        if not gift:
-            await message.reply_text(
-                "Нужна ссылка вида:\n"
-                "t.me/nft/PlushPepe-2687"
-            )
-            return
-
-        context.user_data["gift"] = gift
-        context.user_data["step"] = "buyer"
-
-        await message.reply_text(
-            f"Подарок: {gift['title']}\n\n"
-            "Введи имя покупателя."
-        )
-        return
-
-    if step == "buyer":
-        if not 2 <= len(text) <= 40:
-            await message.reply_text(
-                "Имя должно содержать "
-                "от 2 до 40 символов."
-            )
-            return
-
-        context.user_data["buyer"] = text
-        context.user_data["step"] = "currency"
-
-        await message.reply_text(
-            "Выбери валюту:",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "TON",
-                        callback_data="currency:TON",
-                    ),
-                    InlineKeyboardButton(
-                        "GRAM",
-                        callback_data="currency:GRAM",
-                    ),
-                ]
-            ]),
-        )
-        return
-
-    if step == "price":
-        try:
-            price = Decimal(
-                text.replace(",", ".")
-            )
-        except InvalidOperation:
-            await message.reply_text(
-                "Введи цену числом."
-            )
-            return
-
-        if (
-            not price.is_finite()
-            or price <= 0
-            or price > 1000000000
-        ):
-            await message.reply_text(
-                "Укажи корректную цену."
-            )
-            return
-
-        gift = context.user_data["gift"]
-
-        offer = {
-            "id": uuid.uuid4().hex[:16],
-            "owner": update.effective_user.id,
-            "buyer": context.user_data["buyer"],
-            "title": gift["title"],
-            "url": gift["url"],
-            "price": format(price, "f"),
-            "currency": context.user_data["currency"],
-            "status": "pending",
-        }
-
-        save_offer(offer)
-        context.user_data.clear()
-
-        await message.reply_text(
-            "Предложение создано.\n\n"
-            f"{offer['title']}\n"
-            f"Цена: {price_plain(offer)}\n\n"
-            "Чтобы отправить предложение, "
-            "открой нужный чат и введи:\n\n"
-            f"@{context.bot.username}\n\n"
-            "Выбери оффер из списка."
-        )
-        return
-
-    await message.reply_text(
-        "Выбери действие:",
-        reply_markup=main_menu(),
-    )
-
-
-# =====================================
-# INLINE MODE
-# =====================================
-
-async def inline_query(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    user_id = update.inline_query.from_user.id
-
-    results = []
-
-    for offer in get_offers(user_id):
-        if offer["status"] != "pending":
-            continue
-
-        results.append(
-            InlineQueryResultArticle(
-                id=offer["id"],
-                title=offer["title"],
-                description=price_plain(offer),
-                input_message_content=InputTextMessageContent(
-                    message_text=offer_text(offer),
-                    parse_mode="HTML",
-                    link_preview_options=preview(),
-                ),
-                reply_markup=offer_keyboard(offer),
-            )
-        )
-
-    await update.inline_query.answer(
-        results[:30],
-        cache_time=0,
-        is_personal=True,
-    )
-
-
-# =====================================
-# BUTTONS
-# =====================================
-
-async def buttons(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-    data = query.data or ""
-
-    if data == "create":
-        await query.answer()
-        await create_offer(update, context)
-        return
-
-    if data == "my_offers":
-        await query.answer()
-
-        user_offers = get_offers(
-            query.from_user.id
-        )
-
-        if not user_offers:
-            await query.message.reply_text(
-                "Офферов пока нет."
-            )
-            return
-
-        lines = ["Мои офферы:\n"]
-
-        for offer in user_offers[:15]:
-            lines.append(
-                f"{offer['title']} — "
-                f"{price_plain(offer)} "
-                f"({offer['status']})"
-            )
-
-        await query.message.reply_text(
-            "\n".join(lines)
-        )
-        return
-
-    if data.startswith("currency:"):
-        if context.user_data.get("step") != "currency":
-            await query.answer(
-                "Сначала создай оффер.",
-                show_alert=True,
-            )
-            return
-
-        currency = data.split(":", 1)[1]
-
-        if currency not in ("TON", "GRAM"):
-            await query.answer()
-            return
-
-        context.user_data["currency"] = currency
-        context.user_data["step"] = "price"
-
-        await query.answer()
-
-        await query.message.reply_text(
-            f"Выбрана валюта: {currency}\n\n"
-            "Введи цену числом."
-        )
-        return
-
-    if ":" not in data:
-        await query.answer()
-        return
-
-    action, offer_id = data.split(":", 1)
-    offer = get_offer(offer_id)
-
-    if not offer:
-        await query.answer(
-            "Оффер не найден.",
-            show_alert=True,
-        )
-        return
-
-    if action in ("accept", "reject"):
-        if offer["status"] != "pending":
-            await query.answer(
-                "На предложение уже ответили.",
-                show_alert=True,
-            )
-            return
-
-        if query.from_user.id == offer["owner"]:
-            await query.answer(
-                "Нельзя ответить на собственный оффер.",
-                show_alert=True,
-            )
-            return
-
-        new_status = (
-            "accepted"
-            if action == "accept"
-            else "rejected"
-        )
-
-        update_status(offer_id, new_status)
-        offer["status"] = new_status
-
-        await query.answer(
-            (
-                "Предложение принято. "
-                "Оплата ожидается."
-            )
-            if action == "accept"
-            else "Предложение отклонено.",
-            show_alert=True,
-        )
-
-        try:
-            await query.edit_message_text(
-                text=offer_text(offer),
-                parse_mode="HTML",
-                link_preview_options=preview(),
-                reply_markup=offer_keyboard(offer),
-            )
-        except Exception:
-            logging.exception(
-                "Не удалось обновить сообщение"
-            )
-
-        try:
-            await context.bot.send_message(
-                chat_id=offer["owner"],
-                text=(
-                    f"{offer['title']}\n"
-                    f"Статус: {new_status}"
-                ),
-            )
-        except Exception:
-            logging.exception(
-                "Не удалось отправить уведомление"
-            )
-
-        return
-
-    if action == "payment":
-        await query.answer(
-            "Оплата пока не подтверждена. "
-            "Автоматическая проверка платежей "
-            "не подключена.",
-            show_alert=True,
-        )
-        return
-
-    if action == "help":
-        await query.answer(
-            "Сначала подтвердите получение "
-            "реальной оплаты. Передача NFT "
-            "до оплаты не требуется.",
-            show_alert=True,
-        )
-        return
-
-    await query.answer()
-
-
-# =====================================
-# TEST MODE
-# =====================================
-
-async def demo_payment(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not context.args:
-        await update.message.reply_text(
-            "Команда:\n"
-            "/demo_payment ID_ОФФЕРА"
-        )
-        return
-
-    offer_id = context.args[0]
-    offer = get_offer(offer_id)
-
-    if not offer:
-        await update.message.reply_text(
-            "Оффер не найден."
-        )
-        return
-
-    if offer["owner"] != update.effective_user.id:
-        await update.message.reply_text(
-            "Это не твой оффер."
-        )
-        return
-
-    if offer["status"] != "accepted":
-        await update.message.reply_text(
-            "Сначала предложение должно "
-            "быть принято."
-        )
-        return
-
-    update_status(offer_id, "demo_paid")
-
-    await update.message.reply_text(
-        "ТЕСТОВЫЙ РЕЖИМ\n\n"
-        "Продажа успешно смоделирована.\n"
-        "Реальная оплата не производилась.\n"
-        "NFT не передавался."
-    )
-
-
-# =====================================
-# ERROR HANDLER
-# =====================================
-
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    logging.error(
-        "Ошибка при обработке обновления",
-        exc_info=context.error,
-    )
-
-
-# =====================================
-# MAIN
-# =====================================
-
-def main():
-    init_db()
-
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    app.add_handler(
-        CommandHandler("start", start)
-    )
-
-    app.add_handler(
-        CommandHandler("offer", create_offer)
-    )
-
-    app.add_handler(
-        CommandHandler("demo_payment", demo_payment)
-    )
-
-    app.add_handler(
-        InlineQueryHandler(inline_query)
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(buttons)
-    )
-
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            messages,
-        )
-    )
-
-    app.add_error_handler(error_handler)
-
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+    message = (
+        "<b>Создание предложения</b>\n\n"
+        "От
