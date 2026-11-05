@@ -387,4 +387,503 @@ async def create_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     message = (
         "<b>Создание предложения</b>\n\n"
-        "От
+        "Отправь ссылку на NFT-подарок.\n\n"
+        "Пример:\n"
+        "<code>https://t.me/nft/PlushPepe-2687</code>"
+    )
+
+    if update.callback_query:
+        await update.callback_query.answer()
+
+        await update.callback_query.message.reply_text(
+            message,
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await update.message.reply_text(
+            message,
+            parse_mode=ParseMode.HTML,
+        )
+
+
+# =========================
+# CREATION STEPS
+# =========================
+
+async def handle_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    step = context.user_data.get("step")
+
+    if not step:
+        return
+
+    text = update.message.text.strip()
+
+    if step == "gift":
+        gift = parse_gift(text)
+
+        if not gift:
+            await update.message.reply_text(
+                "Неверная ссылка.\n\n"
+                "Отправь ссылку формата:\n"
+                "https://t.me/nft/PlushPepe-2687"
+            )
+            return
+
+        context.user_data["gift"] = gift
+        context.user_data["step"] = "buyer"
+
+        await update.message.reply_text(
+            f'Подарок: {gift["gift_name"]} '
+            f'#{gift["gift_number"]}\n\n'
+            "Теперь введи имя покупателя."
+        )
+
+        return
+
+    if step == "buyer":
+        if len(text) > 64:
+            await update.message.reply_text(
+                "Имя слишком длинное. Максимум 64 символа."
+            )
+            return
+
+        context.user_data["buyer"] = text
+        context.user_data["step"] = "currency"
+
+        await update.message.reply_text(
+            "Выбери валюту предложения:",
+            reply_markup=currency_keyboard(),
+        )
+
+        return
+
+    if step == "currency":
+        await update.message.reply_text(
+            "Сначала выбери валюту кнопкой выше."
+        )
+        return
+
+    if step == "price":
+        try:
+            price = Decimal(
+                text.replace(",", ".")
+            )
+
+            if not price.is_finite() or price <= 0:
+                raise InvalidOperation
+
+            if price > Decimal("1000000000"):
+                raise InvalidOperation
+
+        except (InvalidOperation, ValueError):
+            await update.message.reply_text(
+                "Введи корректную сумму.\n"
+                "Например: 20 или 1.5"
+            )
+            return
+
+        gift = context.user_data["gift"]
+
+        offer = {
+            "id": uuid.uuid4().hex[:12],
+            "owner": update.effective_user.id,
+            "buyer": context.user_data["buyer"],
+            "gift_name": gift["gift_name"],
+            "gift_number": gift["gift_number"],
+            "gift_url": gift["gift_url"],
+            "price": format(price, "f"),
+            "currency": context.user_data["currency"],
+        }
+
+        save_offer(offer)
+
+        context.user_data.clear()
+
+        username = context.bot.username
+
+        await update.message.reply_text(
+            "<b>Предложение создано!</b>\n\n"
+            f'Подарок: {html.escape(gift_title(offer))}\n'
+            f'Цена: {html.escape(price_plain(offer))}\n\n'
+            "Чтобы отправить предложение:\n\n"
+            "1. Открой нужный чат.\n"
+            f"2. Напиши <code>@{username}</code> и пробел.\n"
+            "3. Выбери созданное предложение.",
+            parse_mode=ParseMode.HTML,
+        )
+
+        return
+
+
+# =========================
+# INLINE MODE
+# =========================
+
+async def inline_query(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.inline_query
+
+    user_id = query.from_user.id
+
+    user_offers = get_user_offers(user_id)
+
+    search = query.query.strip().lower()
+
+    results = []
+
+    for offer in user_offers:
+        if offer["status"] != "pending":
+            continue
+
+        title = gift_title(offer)
+
+        if search and search not in title.lower():
+            continue
+
+        result = InlineQueryResultArticle(
+            id=offer["id"],
+            title=title,
+            description=(
+                f'{offer["buyer"]} · '
+                f'{price_plain(offer)}'
+            ),
+            input_message_content=InputTextMessageContent(
+                message_text=pending_text(offer),
+                parse_mode=ParseMode.HTML,
+                link_preview_options=preview_options(),
+            ),
+            reply_markup=offer_keyboard(offer),
+        )
+
+        results.append(result)
+
+    await query.answer(
+        results=results,
+        cache_time=0,
+        is_personal=True,
+    )
+
+
+# =========================
+# MY OFFERS
+# =========================
+
+async def show_my_offers(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    offers = get_user_offers(
+        update.effective_user.id
+    )
+
+    if not offers:
+        text = "У тебя пока нет созданных предложений."
+    else:
+        lines = ["<b>Мои предложения</b>\n"]
+
+        for offer in offers[:15]:
+            status = {
+                "pending": "Ожидает ответа",
+                "accepted": "Принято, ожидается оплата",
+                "rejected": "Отклонено",
+            }.get(
+                offer["status"],
+                offer["status"],
+            )
+
+            lines.append(
+                f'<b>{html.escape(gift_title(offer))}</b>\n'
+                f'{html.escape(price_plain(offer))}\n'
+                f'Статус: {status}\n'
+                f'ID: <code>{offer["id"]}</code>\n'
+            )
+
+        text = "\n".join(lines)
+
+    if update.callback_query:
+        await update.callback_query.answer()
+
+        await update.callback_query.message.reply_text(
+            text,
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await update.message.reply_text(
+            text,
+            parse_mode=ParseMode.HTML,
+        )
+
+
+# =========================
+# BUTTONS
+# =========================
+
+async def handle_buttons(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    data = query.data or ""
+
+    user_id = query.from_user.id
+
+    if data == "create":
+        await create_offer(update, context)
+        return
+
+    if data == "my_offers":
+        await show_my_offers(update, context)
+        return
+
+    if data.startswith("currency:"):
+        currency = data.split(":", 1)[1]
+
+        if context.user_data.get("step") != "currency":
+            await query.answer(
+                "Начни создание предложения заново.",
+                show_alert=True,
+            )
+            return
+
+        if currency not in ("TON", "GRAM"):
+            await query.answer(
+                "Неизвестная валюта.",
+                show_alert=True,
+            )
+            return
+
+        context.user_data["currency"] = currency
+        context.user_data["step"] = "price"
+
+        await query.answer()
+
+        await query.message.reply_text(
+            f"Валюта: {currency}\n\n"
+            "Теперь введи сумму предложения."
+        )
+
+        return
+
+    if ":" not in data:
+        await query.answer()
+        return
+
+    action, offer_id = data.split(":", 1)
+
+    offer = get_offer(offer_id)
+
+    if not offer:
+        await query.answer(
+            "Предложение не найдено.",
+            show_alert=True,
+        )
+        return
+
+    if action in ("accept", "reject"):
+        if offer["status"] != "pending":
+            await query.answer(
+                "Это предложение уже обработано.",
+                show_alert=True,
+            )
+            return
+
+        if user_id == offer["owner"]:
+            await query.answer(
+                "Нельзя принять собственное предложение.",
+                show_alert=True,
+            )
+            return
+
+        new_status = (
+            "accepted"
+            if action == "accept"
+            else "rejected"
+        )
+
+        changed = update_offer_status(
+            offer_id,
+            "pending",
+            new_status,
+            user_id,
+        )
+
+        if not changed:
+            await query.answer(
+                "Предложение уже обработано.",
+                show_alert=True,
+            )
+            return
+
+        offer = get_offer(offer_id)
+
+        if action == "accept":
+            await query.answer(
+                "Предложение принято!",
+                show_alert=True,
+            )
+        else:
+            await query.answer(
+                "Предложение отклонено.",
+                show_alert=True,
+            )
+
+        try:
+            await query.edit_message_text(
+                text=offer_text(offer),
+                parse_mode=ParseMode.HTML,
+                link_preview_options=preview_options(),
+                reply_markup=offer_keyboard(offer),
+            )
+
+        except Exception:
+            logger.exception(
+                "Не удалось обновить сообщение оффера"
+            )
+
+        try:
+            action_text = (
+                "принято"
+                if action == "accept"
+                else "отклонено"
+            )
+
+            await context.bot.send_message(
+                chat_id=offer["owner"],
+                text=(
+                    f'Предложение по подарку '
+                    f'{gift_title(offer)} '
+                    f'{action_text}.\n\n'
+                    f'Цена: {price_plain(offer)}'
+                ),
+            )
+
+        except Exception:
+            logger.exception(
+                "Не удалось уведомить создателя"
+            )
+
+        return
+
+    if action == "payment":
+        if offer["status"] != "accepted":
+            await query.answer(
+                "Предложение ещё не принято.",
+                show_alert=True,
+            )
+            return
+
+        await query.answer(
+            "Оплата пока не подтверждена.",
+            show_alert=True,
+        )
+
+        return
+
+    if action == "help":
+        await query.answer(
+            "После подтверждения оплаты "
+            "согласуйте передачу подарка. "
+            "Не передавайте NFT до получения средств.",
+            show_alert=True,
+        )
+
+        return
+
+    await query.answer()
+
+
+# =========================
+# CANCEL
+# =========================
+
+async def cancel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        "Создание предложения отменено.",
+        reply_markup=main_keyboard(),
+    )
+
+
+# =========================
+# ERRORS
+# =========================
+
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    logger.error(
+        "Ошибка при обработке обновления",
+        exc_info=(
+            type(context.error),
+            context.error,
+            context.error.__traceback__,
+        ) if context.error else None,
+    )
+
+
+# =========================
+# MAIN
+# =========================
+
+def main():
+    init_db()
+
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .build()
+    )
+
+    app.add_handler(
+        CommandHandler("start", start)
+    )
+
+    app.add_handler(
+        CommandHandler("offer", create_offer)
+    )
+
+    app.add_handler(
+        CommandHandler("my_offers", show_my_offers)
+    )
+
+    app.add_handler(
+        CommandHandler("cancel", cancel)
+    )
+
+    app.add_handler(
+        InlineQueryHandler(inline_query)
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(handle_buttons)
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_message,
+        )
+    )
+
+    app.add_error_handler(error_handler)
+
+    logger.info("Gift Market Bot запущен")
+
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
+
+
+if __name__ == "__main__":
+    main()
